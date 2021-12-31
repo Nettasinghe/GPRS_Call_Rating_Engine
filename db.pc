@@ -1,0 +1,1008 @@
+/////////////////////////////////////////////////// 
+//Project		: GSM GPRS Call Rating and Rerating
+//File			: db.pc 
+//Description	: pro*C file for database mediation
+//Date			: 02 Jan 2002 
+//Author		: Chandika Nettasinghe 
+///////////////////////////////////////////////////
+
+/*
+	 re rate useage - search for RE_RATE_SEARCH - 5 locations in this file
+		a) r_re_rate_gprs_dump_files	<- cdr files
+		b) R_RE_RATED_GPRS_CDR			<- re- rated cdrs (gets inserted here, so clear before use)
+		c) R_RE_RATE_GPRS_CONNECTIONS_V	<- connections
+		d) R_VAS_GPRS_R_V				<- value added service _R_ for rerate
+*/
+
+#include <iostream>
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sqlcpr.h>
+#include <sqlca.h>
+#include <sqlda.h>
+#include <oraca.h>
+
+
+#pragma warning(disable:4786)
+using namespace std;
+
+#ifndef ORA_PROC
+	#include "db.h"
+	#include "db_data_containers.h"
+	#include "Debug.h"
+	extern connections	*gsm_connections;
+#endif
+
+extern int global_cdr_counter;
+
+#define BUF_LEN		100
+#define FETCH_SIZE  10
+#define BUF_L		102
+#define INSERT_SIZE 100
+#define BUF_LENTH	20
+
+EXEC SQL DECLARE CUSTOMER_CARE DATABASE; 
+EXEC SQL DECLARE RATING DATABASE;
+
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char *login_cust_care;
+	char *login_rating;
+EXEC SQL END DECLARE SECTION;
+
+#ifndef code_skip
+#include <fstream>
+extern rated_cdr *gsm_cdr_block;
+#endif
+
+
+void db_error(char* zErrorMsg)
+{
+	EXEC SQL WHENEVER SQLERROR CONTINUE;
+	cout << endl << zErrorMsg << endl<<flush;
+	cout << sqlca.sqlerrm.sqlerrmc << endl<<flush;
+	exit(0);
+}
+
+
+void db_login_customer_care(char* zLoginString)
+{
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	//EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+
+	login_cust_care = zLoginString;
+	EXEC SQL CONNECT :login_cust_care AT CUSTOMER_CARE;
+	cout << "Connecting to Oracle as  :" << login_cust_care << endl;
+	EXEC SQL AT CUSTOMER_CARE ALTER SESSION SET NLS_DATE_FORMAT="DD/MM/YYYY HH24:MI:SS";
+	cout<<"\nConnected to Customer Care Database"<<endl<<endl;
+}
+
+void db_login_rating(char* zLoginString)
+{
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	//EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+
+	login_rating = zLoginString;
+	cout << "Conncecting to Oracle as : " << login_rating << endl;
+	EXEC SQL CONNECT :login_rating AT RATING;
+	EXEC SQL AT RATING ALTER SESSION SET NLS_DATE_FORMAT="DD/MM/YYYY HH24:MI:SS"; 
+	cout<<"\nConnected to Rating Database"<<endl<<endl;
+}
+
+void db_logout_customer_care()
+{
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT CUSTOMER_CARE COMMIT WORK RELEASE;
+	cout<<"\nDisconnect from oracle "<<endl;
+}
+
+void db_logout_rating()
+{
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT RATING COMMIT WORK RELEASE;
+	cout<<"\nDisconnect from oracle "<<endl;
+}
+
+
+// get cdr files
+void cdr_files::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		char file_name[BUF_L];			// varchar2(123)
+		int file_id;					// called id_no in table number(9)
+	} a[FETCH_SIZE]; 
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE;
+	 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+    EXEC SQL AT RATING DECLARE c_cdr_file CURSOR FOR 
+	SELECT	FILE_NAME,  CDR_FILE_ID_NO
+	FROM	gprs_dump_files
+	//FROM	r_re_rate_gprs_dump_files		// RE_RATE_SEARCH - 1
+	WHERE RATING_START_DATE IS NULL;
+       
+    EXEC SQL AT RATING OPEN c_cdr_file; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE;
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:"); 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT RATING FETCH c_cdr_file INTO :a; 		 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d to_fetch=%d\n", rows_this_time, rows_before, rows_to_fetch);
+
+
+		cdr_file_statistics cd;
+		cd.init();
+		for(i=0; i<rows_this_time; i++)
+		{
+			cd.file_id = a[i].file_id;			
+			insert(a[i].file_name, cd);
+		}
+	} 
+
+    EXEC SQL AT RATING CLOSE c_cdr_file; 
+ 
+    printf("\n %d  cdr files loaded.\n\n",rows_before);
+}
+
+
+
+void cdr_files::db_update(cdr_file_statistics s)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		 int valid_cdr_count;					//  number(7)
+		 int error_count;						//	number(7)
+		 int bytes_read;						//	number(9)
+		 char first_cdr_date[BUF_LENTH];				//	varchar2(14)
+		 char last_cdr_date[BUF_LENTH];				//	varchar2(14)
+		 int rating_duration;
+		 char rating_start_date[BUF_LENTH];	//	varchar2(14)
+
+		 int id_no;						//	number(9)
+ 	} a; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL WHENEVER NOT FOUND GOTO nofile;
+
+//#ifndef code_skip
+
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+	 a.id_no = s.file_id;
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+
+	 //a.valid_cdr_count = s.valid_cdr_count;
+	 a.valid_cdr_count = global_cdr_counter;
+	 a.error_count = s.error_count;
+	 a.bytes_read = s.bytes_read;
+	 strcpy(a.first_cdr_date, s.first_cdr_date.c_str());
+	 strcpy(a.last_cdr_date, s.last_cdr_date.c_str());
+	 a.rating_duration = s.rating_duration;
+	 strcpy(a.rating_start_date, s.rating_start_date.c_str());
+	 
+	 	
+//#endif
+
+	 EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	 EXEC SQL AT RATING	
+	 UPDATE gprs_dump_files
+	 //UPDATE	r_re_rate_gprs_dump_files		// RE_RATE_SEARCH - 2
+
+	 SET 
+		valid_cdr_count			= :a.valid_cdr_count, 
+		error_count				= :a.error_count,
+		bytes_read				= :a.bytes_read,
+		first_cdr_date			= to_date(:a.first_cdr_date,'YYYYMMDDHH24MISS'),
+		last_cdr_date			= to_date(:a.last_cdr_date,'YYYYMMDDHH24MISS'),
+		rating_duration			= :a.rating_duration,
+		//rating_start_date		= to_date(:a.rating_start_date,'YYYYMMDDHH24MISS')
+		rating_start_date		= SYSDATE
+	 WHERE cdr_file_id_no  = :a.id_no;
+
+	 EXEC SQL AT RATING COMMIT;
+ 
+    printf("\n cdr file id=%d log updated.\n\n", s.file_id);
+	return;
+nofile:
+	printf("\n <ERROR> file id = %d  not found to update.\n\n", s.file_id);
+}
+
+
+void connections::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct connection
+	{ 
+		int		account_no;
+		char	client_code[BUF_LEN];
+		int		phone_no;
+		char	imsi_no[BUF_LEN]; 
+		char	imei_no[BUF_LEN]; 
+		char	sim_no[BUF_LEN]; 
+		char	group_code[BUF_LEN]; 
+		char	package_code[BUF_LEN];
+		char	commencement_date[BUF_LEN];
+		char	disconnected_date[BUF_LEN];
+		char	contract_end_date[BUF_LEN];
+	} a[FETCH_SIZE];
+	
+	struct connection_ind
+	{ 
+  		short	account_no_ind;
+		short	client_code_ind;
+		short	phone_no_ind;
+		short	imsi_no_ind;
+		short	imei_no_ind;
+		short	sim_no_ind;
+		short	group_code_ind; 
+		short	package_code_ind;
+		short	commencement_date_ind;
+		short	disconnected_date_ind;
+		short	contract_end_date_ind;
+	}a_ind[FETCH_SIZE]; 
+
+	int rows_to_fetch, rows_before, rows_this_time; 
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+    EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT CUSTOMER_CARE DECLARE c_connection CURSOR FOR 
+    SELECT 
+		ACCOUNT_NO, 
+		CLIENT_CLIENT_CODE, 
+		PHONE_REG_PHONE_NO, 
+		IMSI_NO, 
+		IMEI_NO, 
+		SIM_NO, 
+		GROUP_GROUP_CODE, 
+		PKG_PACKAGE_CODE,
+		COMMENCEMENT_DATE,
+		DISCONNECTED_DATE,
+		CONTRACT_END_DATE
+	FROM R_GPRS_CONNECTIONS_V; 
+	//FROM R_RE_RATE_GPRS_CONNECTIONS_V;	// RE_RATE_SEARCH - 3
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_connection; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+        EXEC SQL AT CUSTOMER_CARE FOR :rows_to_fetch FETCH c_connection INTO :a INDICATOR :a_ind;  
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d to_fetch=%d\n", rows_this_time, rows_before, rows_to_fetch);
+
+		connection_detail cd;
+		for (i=0; i<rows_this_time; i++) 
+		{ 
+			//handling null fetches
+			
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no ;
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			a[i].phone_no = (a_ind[i].phone_no_ind < 0) ? 0 : a[i].phone_no ;
+			strcpy(a[i].imsi_no,
+				  ((a_ind[i].imsi_no_ind < 0) ? "UNDEF":a[i].imsi_no));
+			strcpy(a[i].imei_no,
+				  ((a_ind[i].imei_no_ind < 0) ? "UNDEF":a[i].imei_no));
+			strcpy(a[i].sim_no,
+				  ((a_ind[i].sim_no_ind < 0) ? "UNDEF":a[i].sim_no));
+			strcpy(a[i].group_code,
+				  ((a_ind[i].group_code_ind < 0) ? "UNDEF":a[i].group_code));
+			strcpy(a[i].package_code,
+				  ((a_ind[i].package_code_ind < 0) ? "UNDEF":a[i].package_code));
+			strcpy(a[i].commencement_date,
+				  ((a_ind[i].commencement_date_ind < 0) ? "UNDEF":a[i].commencement_date));
+			strcpy(a[i].disconnected_date,
+				  ((a_ind[i].disconnected_date_ind < 0) ? "UNDEF":a[i].disconnected_date));
+			strcpy(a[i].contract_end_date,
+				  ((a_ind[i].contract_end_date_ind < 0) ? "UNDEF":a[i].contract_end_date));
+
+
+			cd.account_no			= a[i].account_no;
+			cd.client_code			= a[i].client_code;
+			cd.phone_no				= a[i].phone_no-77000000;
+			cd.imei_no				= a[i].imei_no; 
+			cd.sim_no				= a[i].sim_no; 
+			cd.group_code			= a[i].group_code; 
+			cd.package_code			= a[i].package_code;
+			//cd.group_rate_plan_id	= a[i].group_rate_plan_id;
+			cd.gross_charge_for_run	= 0;
+
+			insert(a[i].imsi_no, cd );
+			gprs_imsi_map[a[i].imsi_no] = cd;
+			//cout<<cd<<endl;
+		}
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_connection; 
+ 
+    printf("\n %d connections loaded.\n\n",rows_before);
+}
+
+
+void db_insert_rated_cdr(int cdr_count)
+{
+EXEC SQL BEGIN DECLARE SECTION;
+ 
+static struct db_cdr
+{
+	int file_id; 								//	number(9)
+	int file_pos;								//	number(9)
+	int account_no;								//	number(10)
+	float units;								//	number(11,2)
+	float charge;								//	number(11,2)
+	
+	int	data_volume;							//              NUMBER (9), 
+	int record_type;							//                NUMBER (3), 
+	char	uplink_downlink[BUF_LEN];			//           VARCHAR2 (10), 
+	char	call_time[BUF_LEN];					//                 VARCHAR2 (14), 
+	char	sgsn_address[BUF_LEN];				//              VARCHAR2 (20), 
+	char	served_pdp_address[BUF_LEN];		//        VARCHAR2 (20), 
+	char	ggsn_address[BUF_LEN];				//              VARCHAR2 (20), 
+	char	qos_requested_sgsn[BUF_LEN];		//        VARCHAR2 (30), 
+	char	qos_negotiated_sgsn[BUF_LEN];		//       VARCHAR2 (30), 
+	char	qos_negotiated_ggsn[BUF_LEN];		//       VARCHAR2 (30), 
+	int	pdp_type;								//                   NUMBER (3), 
+	int	change_condition_sgsn;					//      NUMBER (3), 
+	int	change_condition_ggsn;					//      NUMBER (3), 
+	char	change_time_sgsn[BUF_LEN];			//          VARCHAR2 (20), 
+	char	change_time_ggsn[BUF_LEN];			//          VARCHAR2 (20), 
+	char	record_opening_time_ggsn[BUF_LEN];	//  VARCHAR2 (20), 
+	int	ms_network_capability;					//      NUMBER (10), 
+	int	location_area_code;						//         NUMBER (10), 
+	int	cell_identity;							//              NUMBER (10), 
+	int	data_uplink_ggsn;						//           NUMBER (30), 
+	int	data_downlink_ggsn;						//         NUMBER (30), 
+	int	charging_id;							//                NUMBER (20), 
+	int	duration;								//                   NUMBER (20), 
+	int	cause_for_rec_closing;					//      NUMBER (20), 
+	int	record_sequence_no;						//         NUMBER (20), 
+	char	routing_area[BUF_LEN];				//              VARCHAR2 (20), 
+	char	access_point_name[BUF_LEN];			//         VARCHAR2 (50), 
+	char	node_id[BUF_LEN];					//                  VARCHAR2 (20), 
+	char	served_msisdn[BUF_LEN];				//             VARCHAR2 (30), 
+	char	rate_rule_id[BUF_LEN];				//              VARCHAR2 (20), 
+	char	imsi[BUF_LEN];						//                      VARCHAR2 (20), 
+	int		result_code;					//                NUMBER (3), 
+	char	discount_type[BUF_LEN];				//             VARCHAR2 (1)
+
+} a[INSERT_SIZE]; 
+
+	int rows_to_insert;
+
+EXEC SQL END DECLARE SECTION;
+	rows_to_insert = cdr_count;
+
+	char buf[100]; 
+	for(int j=0; j<INSERT_SIZE; j++)
+	{
+		a[j].file_pos = 0;
+	}
+
+	for(int i=0; i<INSERT_SIZE; i++)
+	{
+		
+		a[i].file_id =  gsm_cdr_block[i].file_id; 
+		a[i].file_pos = gsm_cdr_block[i].file_pos;
+		a[i].account_no = gsm_cdr_block[i].connection_d.account_no;
+		a[i].units = gsm_cdr_block[i].billing.units;
+		a[i].charge = gsm_cdr_block[i].billing.charge;
+
+		//sprintf(buf,"%04d%02d%02d%02d%02d%02d",d.year,d.month,d.day,t.hour,t.min,t.second);	
+		//strcpy(a[i].call_time, buf);
+
+		a[i].data_volume = gsm_cdr_block[i].data_volume;							//              NUMBER (9), 
+		a[i].record_type = gsm_cdr_block[i].recordType;							//                NUMBER (3), 
+		strcpy(a[i].uplink_downlink, gsm_cdr_block[i].type_of_call.substr(0,10).c_str());			//           VARCHAR2 (10), 
+		strcpy(a[i].call_time, gsm_cdr_block[i].circuit_allocation_time_stamp.substr(0,14).c_str());					//                 VARCHAR2 (14), 
+		sprintf(a[i].sgsn_address,"%d.%d.%d.%d",gsm_cdr_block[i].sgsnAddress.first_int,gsm_cdr_block[i].sgsnAddress.second_int,gsm_cdr_block[i].sgsnAddress.third_int,gsm_cdr_block[i].sgsnAddress.fourth_int);
+		sprintf(a[i].ggsn_address,"%d.%d.%d.%d",gsm_cdr_block[i].ggsnAddress.first_int,gsm_cdr_block[i].ggsnAddress.second_int,gsm_cdr_block[i].ggsnAddress.third_int,gsm_cdr_block[i].ggsnAddress.fourth_int);
+		sprintf(a[i].served_pdp_address,"%d.%d.%d.%d",gsm_cdr_block[i].servedPDPAddress.first_int,gsm_cdr_block[i].servedPDPAddress.second_int,gsm_cdr_block[i].servedPDPAddress.third_int,gsm_cdr_block[i].servedPDPAddress.fourth_int);
+	 
+		sprintf(a[i].qos_requested_sgsn,"%d,%d,%d,%d.%d",gsm_cdr_block[i].qosRequested_SGSN.reliability,gsm_cdr_block[i].qosRequested_SGSN.delay,gsm_cdr_block[i].qosRequested_SGSN.precedence,gsm_cdr_block[i].qosRequested_SGSN.peakThroughput,gsm_cdr_block[i].qosRequested_SGSN.meanThroughput);
+		sprintf(a[i].qos_negotiated_sgsn,"%d,%d,%d,%d.%d",gsm_cdr_block[i].qosNegotiated_SGSN.reliability,gsm_cdr_block[i].qosNegotiated_SGSN.delay,gsm_cdr_block[i].qosNegotiated_SGSN.precedence,gsm_cdr_block[i].qosNegotiated_SGSN.peakThroughput,gsm_cdr_block[i].qosNegotiated_SGSN.meanThroughput);
+		sprintf(a[i].qos_negotiated_ggsn,"%d,%d,%d,%d.%d",gsm_cdr_block[i].qosNegotiated_GGSN.reliability,gsm_cdr_block[i].qosNegotiated_GGSN.delay,gsm_cdr_block[i].qosNegotiated_GGSN.precedence,gsm_cdr_block[i].qosNegotiated_GGSN.peakThroughput,gsm_cdr_block[i].qosNegotiated_GGSN.meanThroughput);
+		
+		a[i].pdp_type = gsm_cdr_block[i].pdpType;								//                   NUMBER (3), 
+		a[i].change_condition_sgsn = gsm_cdr_block[i].changeCondition_SGSN;					//      NUMBER (3), 
+		a[i].change_condition_ggsn = gsm_cdr_block[i].changeCondition_GGSN;					//      NUMBER (3), 
+		strcpy(a[i].change_time_sgsn, gsm_cdr_block[i].changeTime_SGSN);		//          VARCHAR2 (20), 
+		strcpy(a[i].change_time_ggsn, gsm_cdr_block[i].changeTime_GGSN);			//          VARCHAR2 (20), 
+		strcpy(a[i].record_opening_time_ggsn, gsm_cdr_block[i].recordOpeningTime_GGSN);	//  VARCHAR2 (20), 
+		a[i].ms_network_capability = gsm_cdr_block[i].msNetworkCapability;					//      NUMBER (10), 
+		a[i].location_area_code = gsm_cdr_block[i].locationAreaCode;						//         NUMBER (10), 
+		a[i].cell_identity = gsm_cdr_block[i].cellIdentity;							//              NUMBER (10), 
+		a[i].data_uplink_ggsn = gsm_cdr_block[i].dataUplink_GGSN;						//           NUMBER (30), 
+		a[i].data_downlink_ggsn = gsm_cdr_block[i].dataDownlink_GGSN;						//         NUMBER (30), 
+		a[i].charging_id = gsm_cdr_block[i].chargingID;							//                NUMBER (20), 
+		a[i].duration = gsm_cdr_block[i].duration;								//                   NUMBER (20), 
+		a[i].cause_for_rec_closing = gsm_cdr_block[i].causeForRecClosing;					//      NUMBER (20), 
+		a[i].record_sequence_no = gsm_cdr_block[i].recordSequenceNumber;						//         NUMBER (20), 
+		strcpy(a[i].routing_area, gsm_cdr_block[i].routingArea);				//              VARCHAR2 (20), 
+		strcpy(a[i].access_point_name, gsm_cdr_block[i].accessPointName);			//         VARCHAR2 (50), 
+		strcpy(a[i].node_id, gsm_cdr_block[i].nodeID);					//                  VARCHAR2 (20), 
+		strcpy(a[i].served_msisdn, gsm_cdr_block[i].servedMSISDN);				//             VARCHAR2 (30), 
+		strcpy(a[i].rate_rule_id, gsm_cdr_block[i].billing.rate_rule_id.substr(0,20).c_str());
+
+		strcpy(a[i].imsi, gsm_cdr_block[i].servedIMSI);													//
+		
+		a[i].result_code = gsm_cdr_block[i].billing.rate_result;
+		strcpy(a[i].discount_type, gsm_cdr_block[i].billing.discount_type.substr(0,1).c_str());
+
+		
+		
+		// allocate cdr to correct partion
+		/*
+		if(gsm_cdr_block[i].billing.rate_result != R_RATED)
+		{
+			a[i].part = 3;	// unrated
+			sprintf(buf,"%d",gsm_cdr_block[i].call_partner_extension);
+			string a_s;
+			a_s = gsm_cdr_block[i].link_information;
+			a_s = a_s + ":";
+			a_s = a_s + buf;
+			strcpy(a[i].rate_rule_id, a_s.c_str());
+		}
+		// roaming zero & non zero charge cdr's 
+		else if (gsm_cdr_block[i].billing.rate_result == R_RATED && gsm_cdr_block[i].rate_group_id == "ROAM") 
+			a[i].part = 1;	// roaming
+		else if (gsm_cdr_block[i].billing.rate_result == R_RATED && a[i].charge == 0)
+			a[i].part = 2;	// zero charge
+		else
+			a[i].part = 0;	// normal
+		*/
+	} 
+
+// ------------------
+/*
+
+	cout<<" ----------------- rows to insert "<<rows_to_insert<<endl;
+	//for(int k=0; k<INSERT_SIZE; k++)
+	for(int k=0; k<2; k++)
+	{
+		cout<<" "<<k<<"="<<a[k].file_pos ;
+	}
+
+	//for(int l=0; l<INSERT_SIZE; l++)
+	for(int l=0; l<2; l++)
+	{
+		cout<<l<<" file_id"<<a[l].file_id<<endl; 								//	number(9)
+		cout<<l<<" file_pos"<<a[l].file_pos<<endl;								//	number(9)
+		cout<<l<<" account_no"<<a[l].account_no <<endl;								//	number(10)
+		cout<<l<<" termination_type"<<a[l].termination_type<<endl;						//	number(3)
+		cout<<l<<" units"<<a[l].units<<endl;								//	number(11,2)
+		cout<<l<<" charge"<<a[l].charge<<endl;								//	number(11,2)
+		cout<<l<<" call_partner_id"<<a[l].call_partner_id <<endl; 				//	varchar2(20)
+		cout<<l<<" duration"<<a[l].duration <<endl;								//	number(9)
+		cout<<l<<" call_time"<<a[l].call_time <<endl;					//	varchar2(14)
+		cout<<l<<" ms_location"<<a[l].ms_location <<endl;					//	varchar2(20)
+		cout<<l<<" msc_identity"<<a[l].msc_identity <<endl;					//	varchar2(20)
+		cout<<l<<" call_type_id"<<a[l].call_type_id <<endl;							//	number(3)
+		cout<<l<<" network_id"<<a[l].network_id <<endl; 					//	varchar2(5)
+		cout<<l<<" bearer_capability"<<a[l].bearer_capability <<endl;			//	varchar2(10)
+		cout<<l<<" bearer_service"<<a[l].bearer_service <<endl; 						//	number(3)
+		cout<<l<<" rate_rule_id"<<a[l]. rate_rule_id<<endl;					//	varchar2(15)
+		cout<<l<<" service_type_id"<<a[l].service_type_id <<endl;						//	number(3)
+		cout<<l<<" locale_id"<<a[l].locale_id<<endl;								//	number(3)
+		cout<<l<<" imsi"<<a[l].imsi <<endl;							//	varchar2(20)
+		cout<<l<<" imei"<<a[l].imei<<endl;							// varchar2(20)
+		cout<<l<<" result_code"<<a[l].result_code <<endl;
+		cout<<l<<" discount_type"<<a[l].discount_type <<endl;				// varchar2(1)
+		cout<<l<<" mcc"<<a[l].mcc <<endl;							// varchar2(5)
+		cout<<l<<" mnc"<<a[l].mnc <<endl;							// varchar2(3)
+		cout<<l<<" lac"<<a[l].lac<<endl;									// number(5)
+		cout<<l<<" ci"<<a[l].ci<<endl; 									// number(5)
+		cout<<l<<" part"<<a[l].part <<endl;
+		cout<<l<<" charging_indicator"<<a[l].charging_indicator <<endl;						// number(2)
+	}
+*/
+//------
+
+EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+EXEC SQL AT RATING FOR :rows_to_insert INSERT INTO R_RATED_GPRS_CDR VALUES (:a);
+//EXEC SQL AT RATING FOR :rows_to_insert INSERT INTO R_RE_RATED_GPRS_CDR VALUES (:a);	// RE_RATE_SEARCH - 4
+
+EXEC SQL AT RATING COMMIT;
+}
+
+
+
+void holiday_priorities::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct time_band 
+	{ 
+		char	holiday_date[BUF_LEN]; 
+		char	day_id[BUF_LEN];
+		int		priority;
+	} a, *hpp; 
+	int i;
+	EXEC SQL END DECLARE SECTION;
+
+	hpp=&a;
+ 	EXEC ORACLE OPTION (char_map = string);
+
+    EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT CUSTOMER_CARE DECLARE c_holiday_priority CURSOR FOR 
+        SELECT HOLIDAY_DATE, DAY_ID, PRIORITY
+            FROM r_holiday_priorities_v; 
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_holiday_priority; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_holiday_priority INTO :hpp; 
+
+#ifndef code_skip
+		holiday_priority_key k;
+
+		k.day_id=hpp->day_id;
+		k.date.set_date(hpp->holiday_date);
+		insert(k, hpp->priority);
+#endif
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_holiday_priority; 
+ 
+    printf("\n %d holiday priorities loaded.\n\n",i);
+}
+
+
+void rate_groups::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct rate_group
+	{ 
+		char	rate_group_id[BUF_LEN];		// not null varchar2(5)
+		char	re_rate_group_id[BUF_LEN];  // varchar2(5)
+		int		time_threshold;				// not null number(3)
+	} a, *rgp; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+	rgp=&a;
+ 
+    EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT CUSTOMER_CARE DECLARE c_rate_group CURSOR FOR 
+        SELECT	RATE_GROUP_ID, RE_RATE_GROUP_ID, TIME_THRESHOLD
+            FROM R_RATE_GROUPS_V; 
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_rate_group; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break;
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:"); 
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_rate_group INTO :rgp; 
+		rate_group_data rgd;
+		rgd.re_rate_group_id = rgp->re_rate_group_id; 
+		rgd.time_threshold = rgp->time_threshold; 
+
+		insert(rgp->rate_group_id, rgd);
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_rate_group; 
+ 
+    printf("\n %d  rate groups loaded.\n\n",i);
+}
+
+
+void rates::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct rate 
+	{ 
+		char	rate_group_id[BUF_LEN];
+		char	rate_id[BUF_LEN];
+		int		priority;
+		char	default_rate[BUF_LEN];
+		char	call_type_id[BUF_LEN];
+		char	locale_id[BUF_LEN];
+		char	day_id[BUF_LEN];
+		char	route_group_id[BUF_LEN];
+		char	net_group_id[BUF_LEN];
+		char	service_type_id[BUF_LEN];
+		char	time_band_group[BUF_LEN];
+		char	time_band_type[BUF_LEN];
+		char	time_block_id[BUF_LEN];
+		char	discount_group_id[BUF_LEN];
+		char	unit_rate_id[BUF_LEN];
+		int		unit_duration;
+		float	cost_unit;
+		int		billable_duration;
+		char	start_date[BUF_LEN];
+		char	end_date[BUF_LEN];
+		char	start_time[BUF_LEN];
+		char	end_time[BUF_LEN];
+		int		call_duration;
+	} a, *rp; 
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	rp=&a;
+ 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC ORACLE OPTION (char_map = string);
+    EXEC SQL AT CUSTOMER_CARE DECLARE c_rate CURSOR FOR 
+        SELECT	RATE_GROUP_ID, RATE_ID, PRIORITY,
+				DEFAULT_RATE, CALL_TYPE_ID,
+				LOCALE_ID, DAY_ID,
+				ROUTE_GROUP_ID, NET_GROUP_ID,				
+				SERVICE_TYPE_ID, TIME_BAND_GROUP,				
+				TIME_BAND_TYPE, TIME_BLOCK_ID,				
+				DISCOUNT_GROUP_ID, UNIT_RATE_ID,
+				UNIT_DURATION, COST_UNIT, BILLABLE_DURATION,
+				START_DATE,
+				END_DATE,
+				START_TIME,
+				END_TIME,
+				CALL_DURATION							 
+            FROM R_RATE_RULE_GPRS_V; 
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_rate; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_rate INTO :rp; 
+		
+		rate_key rk;
+		rk.rate_group_id=rp->rate_group_id;
+		rk.call_type_id=rp->call_type_id; 
+		rk.locale_id=rp->locale_id; 
+		rk.service_type_id=rp->service_type_id; 
+
+		rate_detail rd;
+		rd.time_band_group=rp->time_band_group; 
+		rd.unit_rate_id=rp->unit_rate_id; 
+		rd.default_rate=rp->default_rate; 
+		rd.rate_id=rp->rate_id; 
+		rd.day_id=rp->day_id;
+		rd.priority=rp->priority; 
+		rd.route_group_id=rp->route_group_id;
+		rd.net_group_id=rp->net_group_id;
+		rd.time_band_type=rp->time_band_type;
+		rd.time_block_id=rp->time_block_id;
+		rd.discount_group_id=rp->discount_group_id;
+		rd.unit_duration=rp->unit_duration;
+		rd.unit_cost=rp->cost_unit;
+		rd.billable_duration=rp->billable_duration;
+
+		rd.start_date=rp->start_date; 
+		rd.end_date=rp->end_date; 
+		rd.active_period.start.set_time(rp->start_time);
+		rd.active_period.end.set_time(rp->end_time);
+		rd.call_duration=rp->call_duration;
+
+		insert(rk,rd);
+
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_rate; 
+ 
+    printf("\n %d  rate rules loaded.\n\n",i);
+}
+
+
+void time_discount_bands::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct time_discount_band 
+	{ 
+		char	band_id[BUF_LEN];
+		int		start_second;
+		int		end_second;
+		int		t_operator;
+		float	t_operand;
+		char	time_discount_group_id[BUF_LEN]; 
+	} a, *tdb_ptr; 
+
+	int i;
+	EXEC SQL END DECLARE SECTION;
+
+	tdb_ptr=&a;
+ 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC ORACLE OPTION (char_map = string);
+    EXEC SQL AT CUSTOMER_CARE DECLARE c_time_discount_band CURSOR FOR 
+        SELECT BAND_ID, START_SECOND, END_SECOND, OPERATOR, OPERAND, DISCOUNT_GROUP_ID
+            FROM R_TIME_DISCOUNT_BANDS_V; 
+       
+    EXEC SQL AT CUSTOMER_CARE OPEN c_time_discount_band; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_time_discount_band INTO :tdb_ptr; 
+		time_discount_band_data d;
+
+		d.start_second=tdb_ptr->start_second;
+		d.end_second=tdb_ptr->end_second;
+		d.dis_operator=(e_operator)tdb_ptr->t_operator;
+		d.dis_operand=tdb_ptr->t_operand;
+
+		insert(tdb_ptr->time_discount_group_id,d);
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_time_discount_band; 
+ 
+    printf("\n %d time discount bands loaded.\n\n",i);
+}
+
+void value_added_services::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct value_added_service
+	{ 
+		int		conn_account_no;					// number(10)
+		char	conn_client_client_code[BUF_LEN];	// varchar2(8)
+		char	service_service_code[BUF_LEN];		// varchar2(5)
+		char	rate_grp_rate_group_id[BUF_LEN];	// varchar2(5)
+		char	start_date[BUF_LEN];				// date
+		char	end_date[BUF_LEN];					// date
+	} a[FETCH_SIZE];
+
+	struct value_added_service_ind
+	{
+		short	conn_account_no_ind;					
+		short	conn_client_client_code_ind;	
+		short	service_service_code_ind;	
+		short	rate_grp_rate_group_id_ind;	
+		short	start_date_ind;				
+		short	end_date_ind;					
+	} a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+
+    EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+	EXEC SQL AT CUSTOMER_CARE DECLARE c_value_added_service CURSOR FOR 
+        SELECT	CONN_ACCOUNT_NO,
+				CONN_CLIENT_CLIENT_CODE, 
+				SERVICE_SERVICE_CODE, 
+				RATE_GRP_RATE_GROUP_ID,
+				START_DATE, 
+				END_DATE
+    FROM R_VALUE_ADDED_SERVICES_GPRS_V;
+	//FROM R_VAS_GPRS_R_V;	// RE_RATE_SEARCH - 5
+      
+    EXEC SQL AT CUSTOMER_CARE OPEN c_value_added_service; 
+ 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+	EXEC SQL WHENEVER SQLERROR DO db_error("ORACLE error:");
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+        EXEC SQL AT CUSTOMER_CARE FETCH c_value_added_service INTO :a INDICATOR :a_ind; 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+
+		client c;
+		
+		for (i=0; i<rows_this_time ;i++) 
+		{ 
+			//handling null fetches
+			
+			a[i].conn_account_no = (a_ind[i].conn_account_no_ind < 0) ? 0 : a[i].conn_account_no;
+			strcpy(a[i].conn_client_client_code,
+				  ((a_ind[i].conn_client_client_code_ind < 0) ? "UNDEF":a[i].conn_client_client_code));
+			strcpy(a[i].service_service_code,
+				  ((a_ind[i].service_service_code_ind < 0) ? "UNDEF":a[i].service_service_code));
+			strcpy(a[i].rate_grp_rate_group_id,
+				  ((a_ind[i].rate_grp_rate_group_id_ind < 0) ? "UNDEF":a[i].rate_grp_rate_group_id));
+			strcpy(a[i].start_date,
+				  ((a_ind[i].start_date_ind < 0) ? "19720710":a[i].start_date));
+			strcpy(a[i].end_date,
+				  ((a_ind[i].end_date_ind < 0) ? "19720710":a[i].end_date));
+			
+			
+			c.account_no	=a[i].conn_account_no;
+			c.client_code	=a[i].conn_client_client_code;
+			c.rate_group_id	=a[i].rate_grp_rate_group_id;
+			c.service_start_date.set_date(a[i].start_date);
+			c.service_end_date.set_date(a[i].end_date);
+
+			//gprs_connections->insert(c.account_no, c);
+
+			gsm_connections->gprs_client_map[c.account_no] = c;
+			
+		}
+    } 
+
+    EXEC SQL AT CUSTOMER_CARE CLOSE c_value_added_service; 
+ 
+    printf("\n %d value_added_services loaded.\n\n",rows_before);
+}
+
+
+void roaming_networks::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct network 
+	{ 
+		char	mcc[BUF_LEN];
+		char	mnc[BUF_LEN];
+		char	rate_group_id[BUF_LEN];
+	} a, *n_w; 
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	n_w = &a;
+	
+	EXEC SQL  AT CUSTOMER_CARE DECLARE c_roam_network CURSOR FOR 
+		SELECT NVL(MCC,''), NVL(MNC,''), NVL(GPRS_RATE_GROUP_ID,'')
+		FROM GSM_NETWORKS; 
+	
+	EXEC SQL AT CUSTOMER_CARE OPEN  c_roam_network; 
+	
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+	
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL FETCH c_roam_network INTO :n_w; 
+		insert(n_w->mcc, n_w->mnc, n_w->rate_group_id);
+	} 
+	
+	EXEC SQL  AT CUSTOMER_CARE CLOSE c_roam_network; 
+	
+	cout<<setw(8)<<i<<" roaming networks loaded."<<endl;
+}
+
+
+void cdr_rejects::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_reject_
+	{ 
+		int 	file_id;
+		int 	file_position;
+		char	uplink_downlink[BUF_LEN];
+	} a[FETCH_SIZE]; 
+
+	struct cdr_reject_ind
+	{ 
+		short 	file_id;
+		short 	file_position;
+		short	uplink_downlink;
+	} ind[FETCH_SIZE]; 
+
+	char t_start[BUF_LEN], t_end[BUF_LEN];
+	int i;
+	int rows_to_fetch, rows_before, rows_this_time; 
+	EXEC SQL END DECLARE SECTION;
+	
+	strcpy(t_start, start_date.c_str());
+	strcpy(t_end, end_date.c_str());
+	
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+	
+	
+	EXEC SQL  AT RATING DECLARE c_rejects CURSOR FOR 
+		SELECT FILE_ID, FILE_POS, UPLINK_DOWNLINK	
+		FROM R_RJECTED_GPRS_CDRS_V WHERE CALL_TIME >= :t_start
+		AND CALL_TIME <= :t_end; 
+	
+	EXEC SQL AT RATING OPEN  c_rejects; 
+	
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+	
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL  AT RATING  FETCH c_rejects INTO :a INDICATOR :ind; 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		
+		for (i=0; i<rows_this_time; i++) 
+		{ 
+			insert(a[i].file_id, a[i].file_position);
+			insert(a[i].file_id, a[i].file_position, a[i].uplink_downlink);
+		}
+	} 
+	
+	EXEC SQL AT RATING CLOSE c_rejects; 
+	
+	cout<<setw(8)<<rows_before<<" rejected cdrs loaded."<<endl;
+}
+
+
+void historic_imsi::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct h_imsi
+	{ 
+		char	imsi[BUF_LEN];
+		int 	account_no;
+		char	start[BUF_LEN];
+		char	end[BUF_LEN];
+	} a[FETCH_SIZE]; 
+
+	struct h_imsi_ind
+	{ 
+		short	imsi;
+		short 	account_no;
+		short	start;
+		short	end;
+	} ind[FETCH_SIZE]; 
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	rows_to_fetch = FETCH_SIZE; 	// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+	
+
+	// get all closed out records
+	EXEC SQL  AT CUSTOMER_CARE DECLARE c_his_imsi CURSOR FOR 
+		SELECT IMSI_NO, ACCOUNT_NO, 
+		TO_CHAR(START_DATE,'YYYYMMDDHH24MISS'), 
+		TO_CHAR(END_DATE,'YYYYMMDDHH24MISS')
+		FROM SIM_NO_HISTORY WHERE END_DATE IS NOT NULL; 
+	
+	EXEC SQL AT CUSTOMER_CARE OPEN  c_his_imsi; 
+	
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+	
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL  AT CUSTOMER_CARE  FETCH c_his_imsi INTO :a INDICATOR :ind; 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		
+		for (i=0; i<rows_this_time; i++) 
+		{
+			insert(a[i].imsi, a[i].account_no, a[i].start, a[i].end);
+		}
+	} 
+	
+	EXEC SQL  AT CUSTOMER_CARE CLOSE c_his_imsi; 
+	
+	cout<<setw(8)<<rows_before<<" historic imsis loaded."<<endl;
+}
+
+
